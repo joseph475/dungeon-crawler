@@ -2,32 +2,12 @@ import { create } from 'zustand'
 import { devtools } from 'zustand/middleware'
 
 /**
- * Combat state — intentionally NOT persisted.
- * A fresh combat starts each session / after every wipe.
+ * Combat state — NOT persisted.
  *
- * Enemy shape:
- * {
- *   id: string,
- *   name: string,
- *   icon: string,
- *   maxHp: number,
- *   currentHp: number,
- *   atk: number,
- *   def: number,
- *   spd: number,
- *   isBoss: boolean,
- * }
+ * Turn-based model: each tick, one entity in `turnQueue` takes their action.
+ * After all entities act → new round is built (sorted by SPD desc).
  *
- * Log entry shape:
- * {
- *   id: number,           auto-incrementing
- *   tick: number,         game tick this happened on
- *   type: 'hit'|'skill'|'ult'|'heal'|'death'|'stage'|'system',
- *   text: string,
- *   actorId: string,      heroId or enemyId
- *   value: number|null,   damage or heal amount
- *   isCrit: boolean,
- * }
+ * turnQueue entry: { id: string, isEnemy: boolean }
  */
 
 let _logId = 0
@@ -36,20 +16,147 @@ export const useCombatStore = create(
   devtools(
     (set, get) => ({
       // ── State ──────────────────────────────────────────────────────────
-      phase: 'idle',        // 'idle' | 'fighting' | 'victory' | 'defeat' | 'advancing'
-      enemies: [],          // array of enemy objects for current fight
-      combatLog: [],        // last N log entries
-      tick: 0,              // current game tick counter
-      stageStartTick: 0,    // tick when this stage started (for clear-time tracking)
-      consecutiveWipes: 0,  // wipes on the same stage in a row
+      phase: 'idle',        // 'idle' | 'fighting' | 'victory' | 'defeat'
+      enemies: [],
+      combatLog: [],
+      tick: 0,
+      stageStartTick: 0,
+      consecutiveWipes: 0,
+      stageModifier: null,  // { id, icon, label, desc, effect, ... } | null
 
-      // Skill cooldown tracking: { [heroId_slot]: ticksRemaining }
+      // ── Turn queue ─────────────────────────────────────────────────────
+      // Ordered array of { id, isEnemy } for the current round.
+      // Consumed front-to-back; when empty, rebuild for next round.
+      turnQueue: [],
+      currentActorIdx: 0,
+      currentActorId: null,   // id of who is acting RIGHT NOW (for UI highlight)
+      roundNumber: 0,
+
+      // Skill cooldowns: { [`${heroId}_${slot}`]: turnsRemaining }
+      // Decremented once per time THAT HERO takes a turn (not per game tick).
       cooldowns: {},
 
-      // Active buffs/debuffs: { [targetId]: [ { stat, multiplier, ticks, id } ] }
+      // Active effects: { [targetId]: [{ type, ... , ticks }] }
+      // Ticked per entity's turn, not per global tick.
       activeEffects: {},
 
-      // ── Actions: lifecycle ─────────────────────────────────────────────
+      // Fight statistics — reset each fight, used for post-combat summary
+      fightStats: {},   // { [heroId]: { dmgDealt: 0, healDone: 0 } }
+
+      // ── Lifecycle ──────────────────────────────────────────────────────
+
+      startFight(enemies, modifier = null) {
+        set((s) => ({
+          phase: 'fighting',
+          enemies: enemies.map((e) => ({ ...e, currentHp: e.maxHp })),
+          cooldowns: {},
+          activeEffects: {},
+          fightStats: {},
+          stageStartTick: s.tick,
+          turnQueue: [],
+          currentActorIdx: 0,
+          currentActorId: null,
+          roundNumber: 0,
+          stageModifier: modifier,
+        }))
+      },
+
+      setStageModifier(modifier) {
+        set({ stageModifier: modifier })
+      },
+
+      setPhase(phase) {
+        set((s) => ({ phase, stageStartTick: s.tick, currentActorId: null }))
+      },
+
+      // ── Turn queue management ──────────────────────────────────────────
+
+      /** Replace the queue with a new round's actor list. */
+      setTurnQueue(queue) {
+        set((s) => ({
+          turnQueue: queue,
+          currentActorIdx: 0,
+          roundNumber: s.roundNumber + 1,
+          currentActorId: queue[0]?.id ?? null,
+        }))
+      },
+
+      /** Current actor (the entity whose turn it is right now). */
+      getCurrentActor() {
+        const { turnQueue, currentActorIdx } = get()
+        return turnQueue[currentActorIdx] ?? null
+      },
+
+      /** Advance to the next actor in the queue. */
+      advanceTurn() {
+        set((s) => {
+          const next = s.currentActorIdx + 1
+          const nextActor = s.turnQueue[next] ?? null
+          return { currentActorIdx: next, currentActorId: nextActor?.id ?? null }
+        })
+      },
+
+      /** Decrement effect durations for ONE entity and remove expired effects. */
+      tickEntityEffects(entityId) {
+        set((s) => {
+          const existing = s.activeEffects[entityId]
+          if (!existing?.length) return {}
+          const alive = existing
+            .map((e) => ({ ...e, ticks: e.ticks - 1 }))
+            .filter((e) => e.ticks > 0)
+          const next = { ...s.activeEffects }
+          if (alive.length) {
+            next[entityId] = alive
+          } else {
+            delete next[entityId]
+          }
+          return { activeEffects: next }
+        })
+      },
+
+      /** Decrement cooldowns for ONE hero (called once per that hero's turn). */
+      tickHeroCooldown(heroId) {
+        set((s) => {
+          const next = { ...s.cooldowns }
+          for (const slot of ['skill', 'ultimate']) {
+            const key = `${heroId}_${slot}`
+            if ((next[key] ?? 0) > 0) {
+              next[key] -= 1
+              if (next[key] <= 0) delete next[key]
+            }
+          }
+          return { cooldowns: next }
+        })
+      },
+
+      /** Decrement all ability cooldowns for ONE enemy (called once per that enemy's turn). */
+      tickEnemyCooldown(enemyId) {
+        set((s) => {
+          const prefix = `enemy_${enemyId}_`
+          const next = { ...s.cooldowns }
+          let changed = false
+          for (const key of Object.keys(next)) {
+            if (key.startsWith(prefix)) {
+              next[key] -= 1
+              changed = true
+              if (next[key] <= 0) delete next[key]
+            }
+          }
+          return changed ? { cooldowns: next } : {}
+        })
+      },
+
+      setEnemyCooldown(enemyId, abilityType, turns) {
+        set((s) => ({
+          cooldowns: { ...s.cooldowns, [`enemy_${enemyId}_${abilityType}`]: turns },
+        }))
+      },
+
+      isEnemyOnCooldown(enemyId, abilityType) {
+        return (get().cooldowns[`enemy_${enemyId}_${abilityType}`] ?? 0) > 0
+      },
+
+      // ── Wipes ──────────────────────────────────────────────────────────
 
       incrementWipes() {
         set((s) => ({ consecutiveWipes: s.consecutiveWipes + 1 }))
@@ -59,21 +166,7 @@ export const useCombatStore = create(
         set({ consecutiveWipes: 0 })
       },
 
-      startFight(enemies) {
-        set((s) => ({
-          phase: 'fighting',
-          enemies: enemies.map((e) => ({ ...e, currentHp: e.maxHp })),
-          cooldowns: {},
-          activeEffects: {},
-          stageStartTick: s.tick,
-        }))
-      },
-
-      setPhase(phase) {
-        set((s) => ({ phase, stageStartTick: s.tick }))
-      },
-
-      // ── Actions: enemies ───────────────────────────────────────────────
+      // ── Enemies ────────────────────────────────────────────────────────
 
       damageEnemy(enemyId, amount) {
         set((s) => ({
@@ -85,37 +178,39 @@ export const useCombatStore = create(
         }))
       },
 
-      /** Returns true if all enemies are at 0 HP (and there is at least one). */
+      healEnemy(enemyId, amount) {
+        set((s) => ({
+          enemies: s.enemies.map((e) =>
+            e.id === enemyId
+              ? { ...e, currentHp: Math.min(e.maxHp, e.currentHp + amount) }
+              : e
+          ),
+        }))
+      },
+
+      getEnemy(id) {
+        return get().enemies.find((e) => e.id === id) ?? null
+      },
+
+      /** Returns true only when there is at least one enemy and all are at 0 HP. */
       allEnemiesDead() {
         const enemies = get().enemies
         return enemies.length > 0 && enemies.every((e) => e.currentHp <= 0)
       },
 
-      // ── Actions: cooldowns ─────────────────────────────────────────────
+      // ── Cooldowns ──────────────────────────────────────────────────────
 
-      setCooldown(heroId, slot, ticks) {
+      setCooldown(heroId, slot, turns) {
         set((s) => ({
-          cooldowns: { ...s.cooldowns, [`${heroId}_${slot}`]: ticks },
+          cooldowns: { ...s.cooldowns, [`${heroId}_${slot}`]: turns },
         }))
-      },
-
-      /** Decrement all cooldowns by 1 each tick. */
-      tickCooldowns() {
-        set((s) => {
-          const next = {}
-          Object.entries(s.cooldowns).forEach(([k, v]) => {
-            if (v > 1) next[k] = v - 1
-            // drops to 0 = expired, so we omit it
-          })
-          return { cooldowns: next }
-        })
       },
 
       isOnCooldown(heroId, slot) {
         return (get().cooldowns[`${heroId}_${slot}`] ?? 0) > 0
       },
 
-      // ── Actions: effects ───────────────────────────────────────────────
+      // ── Effects ────────────────────────────────────────────────────────
 
       addEffect(targetId, effect) {
         set((s) => {
@@ -129,25 +224,11 @@ export const useCombatStore = create(
         })
       },
 
-      /** Decrement effect durations and remove expired ones each tick. */
-      tickEffects() {
-        set((s) => {
-          const next = {}
-          Object.entries(s.activeEffects).forEach(([targetId, effects]) => {
-            const alive = effects
-              .map((e) => ({ ...e, ticks: e.ticks - 1 }))
-              .filter((e) => e.ticks > 0)
-            if (alive.length > 0) next[targetId] = alive
-          })
-          return { activeEffects: next }
-        })
-      },
-
       getEffects(targetId) {
         return get().activeEffects[targetId] ?? []
       },
 
-      // ── Actions: combat log ────────────────────────────────────────────
+      // ── Combat log ─────────────────────────────────────────────────────
 
       log(entry) {
         set((s) => ({
@@ -162,13 +243,36 @@ export const useCombatStore = create(
         set({ combatLog: [] })
       },
 
-      // ── Actions: tick ──────────────────────────────────────────────────
+      // ── Tick counter ───────────────────────────────────────────────────
 
       incrementTick() {
         set((s) => ({ tick: s.tick + 1 }))
       },
 
-      // ── Selectors ─────────────────────────────────────────────────────
+      getStageClearTicks() {
+        const { tick, stageStartTick } = get()
+        return tick - stageStartTick
+      },
+
+      // ── Fight stat tracking ────────────────────────────────────────────
+
+      recordFightDmg(heroId, amount) {
+        if (!heroId || !(amount > 0)) return
+        set((s) => {
+          const prev = s.fightStats[heroId] ?? { dmgDealt: 0, healDone: 0 }
+          return { fightStats: { ...s.fightStats, [heroId]: { ...prev, dmgDealt: prev.dmgDealt + amount } } }
+        })
+      },
+
+      recordFightHeal(heroId, amount) {
+        if (!heroId || !(amount > 0)) return
+        set((s) => {
+          const prev = s.fightStats[heroId] ?? { dmgDealt: 0, healDone: 0 }
+          return { fightStats: { ...s.fightStats, [heroId]: { ...prev, healDone: prev.healDone + amount } } }
+        })
+      },
+
+      // ── Selectors ──────────────────────────────────────────────────────
 
       getLivingEnemies() {
         return get().enemies.filter((e) => e.currentHp > 0)
@@ -176,11 +280,6 @@ export const useCombatStore = create(
 
       getFirstLivingEnemy() {
         return get().enemies.find((e) => e.currentHp > 0) ?? null
-      },
-
-      getStageClearTicks() {
-        const { tick, stageStartTick } = get()
-        return tick - stageStartTick
       },
     }),
     { name: 'CombatStore' }

@@ -86,7 +86,7 @@ export const CLASSES = {
   healer: {
     id: 'healer',
     name: 'Healer',
-    icon: '💚',
+    icon: '✝️',
     role: 'healer',
     description: 'Sustained healing and resurrection support.',
     baseStats: {

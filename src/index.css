@@ -13,3 +13,43 @@ body {
   background-color: #0f0f0f;
   color: #e2e8f0;
 }
+
+/* ── Combat animations ──────────────────────────────────────────── */
+
+@keyframes dmgFloat {
+  0%   { opacity: 1; transform: translateY(0) scale(1); }
+  60%  { opacity: 1; transform: translateY(-18px) scale(1.1); }
+  100% { opacity: 0; transform: translateY(-30px) scale(0.9); }
+}
+
+@keyframes hitShake {
+  0%, 100% { transform: translateX(0); }
+  20%       { transform: translateX(-4px); }
+  40%       { transform: translateX(4px); }
+  60%       { transform: translateX(-3px); }
+  80%       { transform: translateX(3px); }
+}
+
+@keyframes skillFlash {
+  0%   { opacity: 0; transform: scale(0.85); }
+  30%  { opacity: 1; transform: scale(1.05); }
+  70%  { opacity: 1; transform: scale(1); }
+  100% { opacity: 0; transform: scale(0.95); }
+}
+
+@keyframes logSlideIn {
+  from { opacity: 0; transform: translateX(-6px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+.anim-dmg-float  { animation: dmgFloat  0.65s ease-out forwards; }
+.anim-hit-shake  { animation: hitShake  0.35s ease-in-out; }
+.anim-skill-flash { animation: skillFlash 0.55s ease-out forwards; }
+.anim-log-in     { animation: logSlideIn 0.18s ease-out; }
+
+@keyframes idleBreathe {
+  0%, 100% { transform: scale(1);    opacity: 1; }
+  50%      { transform: scale(1.08); opacity: 0.85; }
+}
+
+.anim-idle-breathe { animation: idleBreathe 2.8s ease-in-out infinite; }

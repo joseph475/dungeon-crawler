@@ -28,6 +28,7 @@ export function calcDamage(attacker, defender, opts = {}) {
     critBonus = 0,
     ignoresDef = false,
     defPierce = 0,
+    attackElement = null,
   } = opts
 
   const atkStat = attacker.atk ?? 1
@@ -39,9 +40,17 @@ export function calcDamage(attacker, defender, opts = {}) {
   const isCrit = Math.random() < critRate
   const critMult = isCrit ? (attacker.critDmg ?? 1.5) : 1
 
+  // Element modifier: resist reduces damage, weakness amplifies it
+  let elemMult = 1
+  if (attackElement) {
+    const resist = defender.elementResist?.[attackElement] ?? 0
+    const weak   = defender.elementWeak?.[attackElement] ?? 0
+    elemMult = (1 - resist) * (1 + weak)
+  }
+
   // Apply defender's incoming damage reduction (e.g. from Iron Skin passive)
   const dmgReduce = defender.dmgReduce ?? 0
-  const final = Math.max(1, Math.floor(raw * critMult * (1 - dmgReduce)))
+  const final = Math.max(1, Math.floor(raw * critMult * (1 - dmgReduce) * elemMult))
 
   return { damage: final, isCrit }
 }
@@ -118,6 +127,9 @@ export function applyEffects(baseStats, effects) {
     }
     if (type === 'dmgReduce') {
       result.dmgReduce = Math.min(0.9, (result.dmgReduce ?? 0) + (value ?? 0))
+    }
+    if (type === 'freeze') {
+      result.spd = (result.spd ?? 10) * 0.5
     }
   })
 
